@@ -130,7 +130,7 @@ class NLGC:
 def nlgc_map(name, evoked, forward, noise_cov, labels, order, self_history=None, n_eigenmodes=2, alpha=0.0, beta=0.0,
         patch_idx=[], n_segments=1, loose=0.0, depth=0.0, pca=True, rank=None, lambda_range=None,
         max_iter=500, max_cyclic_iter=3, tol=1e-5, sparsity_factor=0.0, cv=5, use_lapack=True, use_es=True,
-        var_thr=1.0):
+        var_thr=1.0, update_weights=False, weight_prior_var=1.0):
     """NLGC connectivity map estimation
 
     This function estimates the causal connectivity map across sources given the MEG measurements, forward model,
@@ -240,7 +240,8 @@ def nlgc_map(name, evoked, forward, noise_cov, labels, order, self_history=None,
                            ROIs=patch_idx,
                            alpha=alpha, beta=beta, cv=cv, lambda_range=lambda_range, max_iter=max_iter,
                            max_cyclic_iter=max_cyclic_iter, tol=tol, sparsity_factor=sparsity_factor,
-                           use_lapack=use_lapack, use_es=use_es, var_thr=var_thr)
+                           use_lapack=use_lapack, use_es=use_es, var_thr=var_thr,
+                           update_weights=update_weights, weight_prior_var=weight_prior_var)
         d_raw[this_segment] = d_raw_
         bias_r[this_segment] = bias_r_
         bias_f[this_segment] = bias_f_
@@ -255,7 +256,8 @@ def nlgc_map(name, evoked, forward, noise_cov, labels, order, self_history=None,
 
 def _gc_extraction(y, f, r, p, p1, n_eigenmodes=2, var_thr=1.0, ROIs=[], alpha=0, beta=0,
         lambda_range=None, max_iter=500, max_cyclic_iter=3,
-        tol=1e-5, sparsity_factor=0.0, cv=5, use_lapack=True, use_es=True):
+        tol=1e-5, sparsity_factor=0.0, cv=5, use_lapack=True, use_es=True,
+        update_weights=False, weight_prior_var=1.0):
     n, m = f.shape
     nx = m // n_eigenmodes
 
@@ -265,7 +267,9 @@ def _gc_extraction(y, f, r, p, p1, n_eigenmodes=2, var_thr=1.0, ROIs=[], alpha=0
         'beta': beta,
         'max_iter': max_iter,
         'max_cyclic_iter': max_cyclic_iter,
-        'rel_tol': tol
+        'rel_tol': tol,
+        'update_weights': update_weights,
+        'weight_prior_var': weight_prior_var,
     }
 
     # learn the full model

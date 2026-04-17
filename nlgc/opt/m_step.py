@@ -400,6 +400,85 @@ def compute_Q(y, x_, s_, b, a, f, q, r, m, p):
     return  val
 
 
+def update_eigenmode_weights(y, x_bar, f_orig, weights, r, prior_mean=1.0, prior_var=1.0):
+    """Update eigenmode weights w inside the EM loop.
+
+    Given smoothed source estimates x_bar from the E-step, update per-eigenmode
+    scalar weights that scale each column of the forward model:
+
+        f_weighted[:, j] = w_j * f_orig[:, j]
+
+    The update maximises the posterior under a Gaussian prior on w:
+
+        w_j ~ N(prior_mean, prior_var)
+
+    using coordinate descent over eigenmodes.
+
+    Parameters
+    ----------
+    y : ndarray of shape (n_samples, n_channels)
+        Sensor data (already transposed, as used inside _fit).
+    x_bar : ndarray of shape (n_samples, n_sources)
+        Smoothed source estimates (first m columns of x_).
+    f_orig : ndarray of shape (n_channels, n_sources)
+        Original (unweighted) forward model.
+    weights : ndarray of shape (n_sources,)
+        Current eigenmode weights.
+    r : ndarray of shape (n_channels, n_channels)
+        Noise covariance.
+    prior_mean : float
+        Prior mean for each weight (default 1.0).
+    prior_var : float
+        Prior variance for each weight (default 1.0).
+
+    Returns
+    -------
+    weights : ndarray of shape (n_sources,)
+        Updated eigenmode weights.
+    """
+    n, m = f_orig.shape
+    t_samples = x_bar.shape[0]
+
+    # R^{-1}  (fast path for diagonal R)
+    r_diag = np.diag(r) if r.ndim == 2 else r * np.ones(n)
+    r_inv_diag = 1.0 / np.maximum(r_diag, 1e-30)
+    # For diagonal R:  f^T R^{-1} f  =  sum_i  f_i^2 / r_i
+
+    # Current weighted prediction:  Y_pred = x_bar @ (f_orig * w)^T   shape (T, n)
+    f_w = f_orig * weights[None, :]           # (n, m)
+    y_pred = x_bar.dot(f_w.T)                 # (T, n)
+
+    for j in range(m):
+        fj = f_orig[:, j]                     # (n,)
+        xj = x_bar[:, j]                      # (T,)
+
+        # Remove old j-th contribution
+        y_pred -= np.outer(xj, fj * weights[j])
+
+        # Residual with j removed
+        residual = y - y_pred                  # (T, n)
+
+        # Sufficient statistics
+        fj_Rinv_fj = np.dot(fj ** 2, r_inv_diag)           # scalar
+        xj_sq = np.dot(xj, xj)                              # scalar
+
+        # Posterior precision  =  likelihood precision + prior precision
+        precision = fj_Rinv_fj * xj_sq + 1.0 / max(prior_var, 1e-30)
+
+        # Posterior information  =  likelihood info + prior info
+        #   likelihood info = fj^T R^{-1} (sum_t residual_t * xj_t)
+        rxj = residual.T.dot(xj)              # (n,)
+        info = np.dot(fj * r_inv_diag, rxj) + prior_mean / max(prior_var, 1e-30)
+
+        if precision > 1e-30:
+            weights[j] = info / precision
+
+        # Add back updated j-th contribution
+        y_pred += np.outer(xj, fj * weights[j])
+
+    return weights
+
+
 def test_solve_for_a_and_q(t=1000):
     # n, m = 155, 6*2*68
     n, m, p, k = 3, 3, 2, 10
