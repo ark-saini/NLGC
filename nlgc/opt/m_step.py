@@ -400,6 +400,111 @@ def compute_Q(y, x_, s_, b, a, f, q, r, m, p):
     return  val
 
 
+def update_eigenmode_weights(y, x_bar, G_T_list, V_list, r, n_eigenmodes,
+                             prior_var=1.0):
+    """Update per-ROI V weight matrices inside the EM loop.
+
+    Given smoothed source estimates x_bar from the E-step, update V_j matrices
+    that map dipoles to eigenmodes for each ROI:
+
+        F_j = G_j @ V_j    where G_j = G_T_list[j].T
+
+    Initial V_j^(0) = u[:,:K] from SVD of G_j^T.
+    Updated by solving regularised least-squares with Gaussian prior
+    centered at V_j^(0):   vec(V_j) ~ N(vec(V_j^(0)), prior_var * I)
+
+    Parameters
+    ----------
+    y : ndarray (n_samples, n_channels)
+        Sensor data (transposed, as inside _fit).
+    x_bar : ndarray (n_samples, n_sources)
+        Smoothed source estimates (first m columns of x_).
+    G_T_list : list of ndarray
+        Per-ROI full forward (transposed): shape (n_dipoles_j, n_channels).
+    V_list : list of ndarray
+        Current V_j matrices: shape (n_dipoles_j, K).
+    r : ndarray (n_channels, n_channels)
+        Noise covariance.
+    n_eigenmodes : int
+        K = number of eigenmodes per ROI.
+    prior_var : float
+        Prior variance on each element of V_j.
+
+    Returns
+    -------
+    V_list : list of ndarray
+        Updated V_j matrices.
+    f_new : ndarray (n_channels, n_sources)
+        Recomputed forward from updated V_j.
+    """
+    K = n_eigenmodes
+    nx = len(V_list)
+    n_channels = y.shape[1]
+
+    # R^{-1} diagonal fast path
+    r_diag = np.diag(r) if r.ndim == 2 else r * np.ones(n_channels)
+    r_inv_diag = 1.0 / np.maximum(r_diag, 1e-30)
+
+    # Build current forward and prediction
+    f_blocks = []
+    for j in range(nx):
+        G_j = G_T_list[j].T           # (n_channels, d_j)
+        f_blocks.append(G_j @ V_list[j])  # (n_channels, K)
+    f_current = np.concatenate(f_blocks, axis=1)  # (n_channels, m)
+    Y_pred = x_bar.dot(f_current.T)               # (T, n_channels)
+
+    # Store initial V for prior center
+    V_init_list = [v.copy() for v in V_list]
+    prior_prec = 1.0 / max(prior_var, 1e-30)
+
+    for j in range(nx):
+        cols = slice(j * K, (j + 1) * K)
+        G_j_T = G_T_list[j]               # (d_j, n_channels)
+        G_j = G_j_T.T                     # (n_channels, d_j)
+        V_j_old = V_list[j]               # (d_j, K)
+        X_j = x_bar[:, cols]              # (T, K)
+        d_j = G_j_T.shape[0]
+
+        # Remove old ROI j contribution
+        F_j_old = G_j @ V_j_old           # (n_channels, K)
+        Y_pred -= X_j.dot(F_j_old.T)
+
+        # Residual with ROI j removed
+        residual = y - Y_pred              # (T, n_channels)
+
+        # C = G_j^T R^{-1} G_j  shape (d_j, d_j)
+        G_j_T_Rinv = G_j_T * r_inv_diag[None, :]
+        C = G_j_T_Rinv.dot(G_j_T.T)
+
+        # S_xx = X_j^T X_j  shape (K, K)
+        S_xx = X_j.T.dot(X_j)
+
+        # info = G_j^T R^{-1} (residual^T X_j)  shape (d_j, K)
+        RX = residual.T.dot(X_j)          # (n_channels, K)
+        info_matrix = G_j_T_Rinv.dot(RX)  # (d_j, K)
+
+        # Solve (S_xx kron C + prior_prec * I) vec(V_j) = vec(info) + prior_prec * vec(V_init)
+        precision = np.kron(S_xx, C)
+        precision[np.diag_indices_from(precision)] += prior_prec
+
+        rhs = info_matrix.ravel(order='F') + prior_prec * V_init_list[j].ravel(order='F')
+
+        try:
+            vec_V = linalg.solve(precision, rhs, assume_a='pos')
+        except linalg.LinAlgError:
+            vec_V = linalg.solve(precision, rhs, assume_a='sym')
+
+        V_list[j] = vec_V.reshape((d_j, K), order='F')
+
+        # Add back updated contribution
+        F_j_new = G_j @ V_list[j]
+        Y_pred += X_j.dot(F_j_new.T)
+
+    # Recompute full forward
+    f_new = np.concatenate([G_T_list[j].T @ V_list[j] for j in range(nx)], axis=1)
+    return V_list, f_new
+
+
 def test_solve_for_a_and_q(t=1000):
     # n, m = 155, 6*2*68
     n, m, p, k = 3, 3, 2, 10

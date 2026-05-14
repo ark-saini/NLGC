@@ -130,7 +130,7 @@ class NLGC:
 def nlgc_map(name, evoked, forward, noise_cov, labels, order, self_history=None, n_eigenmodes=2, alpha=0.0, beta=0.0,
         patch_idx=[], n_segments=1, loose=0.0, depth=0.0, pca=True, rank=None, lambda_range=None,
         max_iter=500, max_cyclic_iter=3, tol=1e-5, sparsity_factor=0.0, cv=5, use_lapack=True, use_es=True,
-        var_thr=1.0):
+        var_thr=1.0, update_weights=False, weight_prior_var=1.0):
     """NLGC connectivity map estimation
 
     This function estimates the causal connectivity map across sources given the MEG measurements, forward model,
@@ -197,7 +197,7 @@ def nlgc_map(name, evoked, forward, noise_cov, labels, order, self_history=None,
     if not is_fixed_orient(forward):
         raise ValueError(f"Cannot work with free orientation forward: {forward}")
 
-    G, label_vertidx, label_names, gain_info, whitener = \
+    G, label_vertidx, label_names, gain_info, whitener, G_T_list, V_list = \
         _prepare_eigenmodes(evoked, forward, noise_cov, labels, n_eigenmodes, loose, depth, pca, rank)
 
     # get the data
@@ -240,7 +240,9 @@ def nlgc_map(name, evoked, forward, noise_cov, labels, order, self_history=None,
                            ROIs=patch_idx,
                            alpha=alpha, beta=beta, cv=cv, lambda_range=lambda_range, max_iter=max_iter,
                            max_cyclic_iter=max_cyclic_iter, tol=tol, sparsity_factor=sparsity_factor,
-                           use_lapack=use_lapack, use_es=use_es, var_thr=var_thr)
+                           use_lapack=use_lapack, use_es=use_es, var_thr=var_thr,
+                           update_weights=update_weights, weight_prior_var=weight_prior_var,
+                           G_T_list=G_T_list, V_list=V_list)
         d_raw[this_segment] = d_raw_
         bias_r[this_segment] = bias_r_
         bias_f[this_segment] = bias_f_
@@ -255,7 +257,8 @@ def nlgc_map(name, evoked, forward, noise_cov, labels, order, self_history=None,
 
 def _gc_extraction(y, f, r, p, p1, n_eigenmodes=2, var_thr=1.0, ROIs=[], alpha=0, beta=0,
         lambda_range=None, max_iter=500, max_cyclic_iter=3,
-        tol=1e-5, sparsity_factor=0.0, cv=5, use_lapack=True, use_es=True):
+        tol=1e-5, sparsity_factor=0.0, cv=5, use_lapack=True, use_es=True,
+        update_weights=False, weight_prior_var=1.0, G_T_list=None, V_list=None):
     n, m = f.shape
     nx = m // n_eigenmodes
 
@@ -265,7 +268,9 @@ def _gc_extraction(y, f, r, p, p1, n_eigenmodes=2, var_thr=1.0, ROIs=[], alpha=0
         'beta': beta,
         'max_iter': max_iter,
         'max_cyclic_iter': max_cyclic_iter,
-        'rel_tol': tol
+        'rel_tol': tol,
+        'update_weights': update_weights,
+        'weight_prior_var': weight_prior_var,
     }
 
     # learn the full model
@@ -294,6 +299,10 @@ def _gc_extraction(y, f, r, p, p1, n_eigenmodes=2, var_thr=1.0, ROIs=[], alpha=0
     else:
         model_f = NeuraLVAR(p, p1, n_eigenmodes, use_lapack=use_lapack)
         lambda_range = lambda_range[0]
+
+    # Set per-ROI forward data for V weight updates
+    if G_T_list is not None and V_list is not None:
+        model_f._roi_data = {'G_T_list': G_T_list, 'V_list': V_list}
 
     model_f.fit(y, f, r * np.eye(n), lambda_range, a_init=a_init, q_init=q_init.copy(), **kwargs)
     bias_f = model_f.compute_bias(y)
@@ -432,20 +441,22 @@ def _prepare_eigenmodes(evoked, forward, noise_cov, labels, n_eigenmodes=2, loos
 
     # whiten the data
     logger.info('Whitening data matrix.')
+    G_T_list = None
+    V_list = None
     if isinstance(labels, Forward):
-        G, label_vertidx, src_flip = _reduce_lead_field(forward, labels, n_eigenmodes, data=gain.T)
+        G, label_vertidx, src_flip, G_T_list, V_list = _reduce_lead_field(forward, labels, n_eigenmodes, data=gain.T)
         label_names = []
         for i, label in enumerate(labels['src']):
             label_names.extend(map(lambda x: f'{i}-{x}', label['vertno']))
     elif isinstance(labels, SourceSpaces):
-        G, label_vertidx, src_flip = _reduce_lead_field(forward, labels, n_eigenmodes, data=gain.T)
+        G, label_vertidx, src_flip, G_T_list, V_list = _reduce_lead_field(forward, labels, n_eigenmodes, data=gain.T)
         label_names = []
         for i, label in enumerate(labels):
             label_names.extend(map(lambda x: f'{i}-{x}', label['vertno']))
     elif isinstance(labels, list):
         if isinstance(labels[0], Label):
-            G, label_vertidx, src_flip = _extract_label_eigenmodes(forward, labels, gain.T, mode, n_eigenmodes,
-                                                                   allow_empty=True)
+            G, label_vertidx, src_flip, G_T_list, V_list = _extract_label_eigenmodes(
+                forward, labels, gain.T, mode, n_eigenmodes, allow_empty=True)
             label_names = [label.name for label in labels]
         else:
             raise ValueError('Not supported {:s}: elements of labels are expected to be mne.Labels, '
@@ -459,6 +470,13 @@ def _prepare_eigenmodes(evoked, forward, noise_cov, labels, n_eigenmodes=2, loos
     G = G[:, sel].copy()
     label_vertidx = [i for select, i in zip(sel, label_vertidx) if select]
     src_flip = [i for select, i in zip(sel, src_flip) if select]
+
+    # also filter G_T_list and V_list for discarded ROIs
+    if G_T_list is not None:
+        sel_roi = sel[::n_eigenmodes]
+        G_T_list = [g for select, g in zip(sel_roi, G_T_list) if select]
+        V_list = [v for select, v in zip(sel_roi, V_list) if select]
+
     discarded_labels = []
     j = 0
     for i, sel_ in enumerate(sel[::n_eigenmodes]):
@@ -471,7 +489,7 @@ def _prepare_eigenmodes(evoked, forward, noise_cov, labels, n_eigenmodes=2, loos
         logger.info('No sources were found in following {:d} ROIs:\n'.format(len(discarded_labels)) +
                     '\n'.join(map(lambda x: str(x.name), discarded_labels)))
 
-    return G, label_vertidx, label_names, gain_info, whitener
+    return G, label_vertidx, label_names, gain_info, whitener, G_T_list, V_list
 
 
 def _reduce_lead_field(forward, src, n_eigenmodes, data=None):
@@ -486,13 +504,20 @@ def _reduce_lead_field(forward, src, n_eigenmodes, data=None):
 
     grouped_vertidx, n_groups, n_verts = _prepare_leadfield_reduction(src, forward['src'])
     group_eigenmodes = np.zeros((sum(n_groups) * n_eigenmodes,) + data.shape[1:], dtype=data.dtype)
+
+    G_T_list = []    # list of G_j^T arrays, each (n_dipoles_j, n_channels)
+    V_list = []      # list of u[:,:K] arrays, each (n_dipoles_j, K)
+
     for i, this_grouped_vertidx in enumerate(grouped_vertidx):
-        this_group_eigenmodes, percentage_explained = _truncatedsvd(data[this_grouped_vertidx],
-                                                                    n_eigenmodes, return_pecentage_exaplained=True)
+        G_j_T = data[this_grouped_vertidx]  # (n_dipoles_j, n_channels)
+        this_group_eigenmodes, v_weights, percentage_explained = \
+            _truncatedsvd_full(G_j_T, n_eigenmodes)
         group_eigenmodes[i * n_eigenmodes:(i + 1) * n_eigenmodes] = this_group_eigenmodes
+        G_T_list.append(G_j_T.copy())
+        V_list.append(v_weights)
 
     src_flips = [None] * sum(n_groups)
-    return group_eigenmodes.T, grouped_vertidx, src_flips
+    return group_eigenmodes.T, grouped_vertidx, src_flips, G_T_list, V_list
 
 
 def _prepare_label_extraction(labels, src):
@@ -623,6 +648,8 @@ def _extract_label_eigenmodes(fwd, labels, data=None, mode='mean', n_eigenmodes=
 
         # do the extraction
         label_eigenmodes = np.zeros((n_labels * n_eigenmodes,) + data.shape[1:], dtype=data.dtype)
+        G_T_list = []
+        V_list = []
         for i, (vertidx, flip, label) in enumerate(zip(label_vertidx, src_flip, labels)):
             if vertidx is not None:
                 if isinstance(vertidx, sparse.csr_matrix):
@@ -637,7 +664,19 @@ def _extract_label_eigenmodes(fwd, labels, data=None, mode='mean', n_eigenmodes=
                 label_eigenmodes[i * n_eigenmodes:(i + 1) * n_eigenmodes] = \
                     func(flip, this_data, n_eigenmodes)
 
-        return label_eigenmodes.T, label_vertidx, src_flip
+                # Also extract V weights for weight updates
+                if flip is not None:
+                    svd_data = flip * this_data
+                else:
+                    svd_data = this_data
+                _, v_weights, _ = _truncatedsvd_full(svd_data.copy(), n_eigenmodes)
+                G_T_list.append(this_data.copy())
+                V_list.append(v_weights)
+            else:
+                G_T_list.append(None)
+                V_list.append(None)
+
+        return label_eigenmodes.T, label_vertidx, src_flip, G_T_list, V_list
 
 
 def _expand_roi_indices_as_tup(reg_idx, emod):
@@ -654,6 +693,33 @@ def _truncatedsvd(a, n_components=2, return_pecentage_exaplained=False):
     if return_pecentage_exaplained:
         return vh[:n_components] * s[:n_components][:, None], s[:n_components].sum() / s.sum()
     return vh[:n_components] * s[:n_components][:, None]
+
+
+def _truncatedsvd_full(a, n_components=2):
+    """SVD that also returns the weight matrix u[:,:K].
+
+    Given a = G_j^T of shape (n_dipoles, n_channels):
+        G_j^T = u @ diag(s) @ vh
+
+    Returns
+    -------
+    eigenmodes : ndarray (K, n_channels)
+        vh[:K] * s[:K]  — the reduced forward (transposed).
+    v_weights : ndarray (n_dipoles, K)
+        u[:, :K]  — the initial V weights.
+    percentage : float
+        Fraction of energy explained.
+    """
+    if n_components > min(*a.shape):
+        raise ValueError('n_components={:d} should be smaller than '
+                         'min({:d}, {:d})'.format(n_components, *a.shape))
+    u, s, vh = linalg.svd(a, full_matrices=False, compute_uv=True,
+                          overwrite_a=False, check_finite=True,
+                          lapack_driver='gesdd')
+    eigenmodes = vh[:n_components] * s[:n_components][:, None]
+    v_weights = u[:, :n_components]
+    percentage = s[:n_components].sum() / s.sum()
+    return eigenmodes, v_weights, percentage
 
 
 _svd_funcs = {

@@ -14,7 +14,7 @@ from mne.utils import logger
 
 from .e_step import sskf, sskfcv, align_cast, sskf_prediction
 from .m_step import (calculate_ss, solve_for_a, solve_for_q, compute_ll,
-                     compute_cross_ll, compute_Q)
+                     compute_cross_ll, compute_Q, update_eigenmode_weights)
 
 # filename = os.path.realpath(os.path.join(__file__, '..', '..', "debug.log"))
 # logging.basicConfig(filename=filename, level=logging.DEBUG)
@@ -41,6 +41,8 @@ class NeuraLVAR:
     lambda_ = None
     _zeroed_index = None
     restriction = None
+    _eigenmode_weights = None  # V_list: list of (n_dipoles_j, K) per ROI
+    _roi_data = None           # dict with 'G_T_list' and 'V_list'
 
     def __init__(self, order, self_history=None, n_eigenmodes=None, copy=True, standardize=False, normalize=False,
             use_lapack=True):
@@ -62,7 +64,8 @@ class NeuraLVAR:
         self._n_eigenmodes = 1 if n_eigenmodes is None else n_eigenmodes
 
     def _fit(self, y, f, r, lambda2=None, max_iter=500, max_cyclic_iter=3, a_init=None, q_init=None,
-            rel_tol=0.01, xs=None, alpha=0.0, beta=0.0, fixed_a=False, fixed_q=False):
+            rel_tol=0.01, xs=None, alpha=0.0, beta=0.0, fixed_a=False, fixed_q=False,
+            update_weights=False, weight_prior_var=1.0):
         """Internal function that fits the model from given data
 
         Parameters
@@ -124,6 +127,19 @@ class NeuraLVAR:
         ll_s = []
         Qvals = []
         source_fits = []
+
+        # --- eigenmode V weight initialisation ---
+        n_eigenmodes = self._n_eigenmodes
+        nx = m // n_eigenmodes
+        has_roi_data = (update_weights and self._roi_data is not None
+                        and 'G_T_list' in self._roi_data
+                        and 'V_list' in self._roi_data)
+        if has_roi_data:
+            G_T_list = self._roi_data['G_T_list']
+            V_list = [v.copy() for v in self._roi_data['V_list']]
+            self._eigenmode_weights = V_list
+        # ------------------------------------------
+
         for i in range(max_iter):
             a_[:m] = a_upper
             q_[non_zero_indices] = q_upper[non_zero_indices]
@@ -158,8 +174,20 @@ class NeuraLVAR:
                 if q_upper.min() < 0:
                     warnings.warn(f'Q possibly contains negative value {q_upper.min()}', RuntimeWarning)
 
+            # --- V weight update (recursive, based on posterior) ---
+            if has_roi_data:
+                V_list, f_new = update_eigenmode_weights(
+                    y, x_[:, :m], G_T_list, V_list, r,
+                    n_eigenmodes=n_eigenmodes,
+                    prior_var=weight_prior_var,
+                )
+                self._eigenmode_weights = V_list
+                f_[:, :m] = f_new
+                f = f_new
+            # -------------------------------------------------------
+
         a = self._unravel_a(a_upper)
-        return a, q_upper, (lls, ll_s, Qvals, source_fits), f, r, zeroed_index, xs, x_
+        return a, q_upper, (lls, ll_s, Qvals, source_fits), f, r, zeroed_index, xs, x_, self._eigenmode_weights
 
     def compute_ll(self, y, args=None):
         """Returns log(p(y|args=(a, f, q, r))).
@@ -304,7 +332,8 @@ class NeuraLVAR:
         return bias
 
     def fit(self, y, f, r, lambda2=None, max_iter=500, max_cyclic_iter=3, a_init=None, q_init=None, rel_tol=0.0001,
-            restriction=None, alpha=0.0, beta=0.0, use_es=None):
+            restriction=None, alpha=0.0, beta=0.0, use_es=None,
+            update_weights=False, weight_prior_var=1.0):
         """Fits the model from given m/eeg data, forward gain and noise covariance
 
         Parameters
@@ -322,6 +351,10 @@ class NeuraLVAR:
             i and j should be integers.
         alpha: float, default = 0.5
         beta : float, default = 1
+        update_weights : bool, default=False
+            If True, update per-ROI V weight matrices inside the EM loop.
+        weight_prior_var : float, default=1.0
+            Prior variance for V weight elements.
 
         Notes
         -----
@@ -333,9 +366,11 @@ class NeuraLVAR:
         if (restriction is None or re.search('->', restriction)) is False:
             raise ValueError(f"restriction:{restriction} should be None or should have format 'i->j'!")
         self.restriction = restriction
-        a, q_upper, lls, f, r, zeroed_index, _, x_ = self._fit(y, f, r, lambda2=lambda2, max_iter=max_iter,
-                                                               max_cyclic_iter=max_cyclic_iter, a_init=a_init,
-                                                               q_init=q_init, rel_tol=rel_tol, alpha=alpha, beta=beta)
+        a, q_upper, lls, f, r, zeroed_index, _, x_, w = self._fit(
+            y, f, r, lambda2=lambda2, max_iter=max_iter,
+            max_cyclic_iter=max_cyclic_iter, a_init=a_init,
+            q_init=q_init, rel_tol=rel_tol, alpha=alpha, beta=beta,
+            update_weights=update_weights, weight_prior_var=weight_prior_var)
         self._parameters = (a, f, q_upper, r, x_)
         self._zeroed_index = zeroed_index
         self._lls = lls
@@ -513,7 +548,7 @@ class NeuraLVARCV(NeuraLVAR):
             if i > 0:
                 a_init = a_.copy()
                 # q_init = q_upper.copy() * lambda_range[i-1] / lambda_range[i]
-            a_, q_upper, lls, _, _, _, xs, _ = \
+            a_, q_upper, lls, _, _, _, xs, _, _ = \
                 self._fit(y_train, f, r, lambda2=lambda2, max_iter=max_iter,
                           max_cyclic_iter=max_cyclic_iter,
                           a_init=a_init, q_init=q_init.copy(), rel_tol=rel_tol, xs=xs, alpha=alpha, beta=beta)
@@ -532,7 +567,8 @@ class NeuraLVARCV(NeuraLVAR):
         return None
 
     def fit(self, y, f, r, lambda_range=None, max_iter=500, max_cyclic_iter=3, a_init=None, q_init=None,
-            rel_tol=1e-5, restriction=None, alpha=0.0, beta=0.0, use_es=True):
+            rel_tol=1e-5, restriction=None, alpha=0.0, beta=0.0, use_es=True,
+            update_weights=False, weight_prior_var=1.0):
         """Fits the model from given m/eeg data, forward gain and noise covariance
 
         y : ndarray of shape (n_channels, n_samples)
@@ -548,6 +584,10 @@ class NeuraLVARCV(NeuraLVAR):
             i and j should be integers.
         alpha: float, default = 0.5
         beta : float, default = 1
+        update_weights : bool, default=False
+            If True, update per-ROI V weight matrices inside the EM loop.
+        weight_prior_var : float, default=1.0
+            Prior variance for V weight elements.
 
         Notes
         -----
@@ -560,7 +600,7 @@ class NeuraLVARCV(NeuraLVAR):
 
         y, f = align_cast((y, f), self._use_lapack)  # to make y, f contiguous in 'F'
 
-        if lambda_range is None or lambda_range == 'auto':
+        if lambda_range is None or (isinstance(lambda_range, str) and lambda_range == 'auto'):
             raise NotImplementedError("Try specifying a pre-determined range")
         else:
             if not isinstance(lambda_range, np.ndarray):
@@ -624,9 +664,11 @@ class NeuraLVARCV(NeuraLVAR):
             best_lambda = lambda_range[index]
             print(f'best_regularizing parameter: {best_lambda}')
 
-        a, q_upper, lls, f, r, zeroed_index, _, x_ = self._fit(y, f, r, lambda2=best_lambda, max_iter=max_iter,
-                                                               max_cyclic_iter=max_cyclic_iter, a_init=a_init,
-                                                               q_init=q_init, rel_tol=rel_tol, alpha=alpha, beta=beta)
+        a, q_upper, lls, f, r, zeroed_index, _, x_, w = self._fit(
+            y, f, r, lambda2=best_lambda, max_iter=max_iter,
+            max_cyclic_iter=max_cyclic_iter, a_init=a_init,
+            q_init=q_init, rel_tol=rel_tol, alpha=alpha, beta=beta,
+            update_weights=update_weights, weight_prior_var=weight_prior_var)
         self._parameters = (a, f, q_upper, r, x_)
         self._zeroed_index = zeroed_index
         self._lls = lls
