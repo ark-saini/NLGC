@@ -20,9 +20,6 @@ Why Frobenius?
 
 Results saved to: results/weight_recovery.pkl
 
-Run:
-    cd /Users/as12123/NLGC
-    python verify_weight_recovery.py
 """
 
 import numpy as np
