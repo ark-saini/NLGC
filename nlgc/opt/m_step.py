@@ -400,62 +400,67 @@ def compute_Q(y, x_, s_, b, a, f, q, r, m, p):
     return  val
 
 
-def update_eigenmode_weights(y, x_bar, G_T_list, V_list, r, n_eigenmodes,
-                             prior_var=1.0):
-    """Update per-ROI V weight matrices inside the EM loop.
+def update_eigenmode_weights(y, x_bar, f_orig, G_T_list, V_list, r,
+                             n_eigenmodes, prior_var):
+    """Update per-ROI V weight matrices and the shared prior variance.
 
-    Given smoothed source estimates x_bar from the E-step, update V_j matrices
-    that map dipoles to eigenmodes for each ROI:
+    Prior is zero-mean Gaussian shared across all ROIs:
 
-        F_j = G_j @ V_j    where G_j = G_T_list[j].T
+        vec(V_j) ~ N(0, sigma_w^2 * I)
 
-    Initial V_j^(0) = u[:,:K] from SVD of G_j^T.
-    Updated by solving regularised least-squares with Gaussian prior
-    centered at V_j^(0):   vec(V_j) ~ N(vec(V_j^(0)), prior_var * I)
+    The prior variance sigma_w^2 is updated empirically (Empirical Bayes)
+    after the coordinate-descent V update:
+
+        sigma_w^2 = (1 / N_total) * sum_j ||V_j||_F^2
+
+    where N_total = sum_j (d_j * K) is the total number of weight params.
+
+    The original forward f_orig is kept unchanged. The weighted forward is
+    recomputed as:
+
+        F_j = G_j @ V_j  =>  f_weighted = [G_1 V_1 | ... | G_J V_J]
 
     Parameters
     ----------
     y : ndarray (n_samples, n_channels)
-        Sensor data (transposed, as inside _fit).
+        Sensor data transposed (as inside _fit).
     x_bar : ndarray (n_samples, n_sources)
-        Smoothed source estimates (first m columns of x_).
+        Smoothed source estimates (first m cols of x_).
+    f_orig : ndarray (n_channels, n_sources)
+        Original (unweighted) forward — kept, never modified.
     G_T_list : list of ndarray
-        Per-ROI full forward (transposed): shape (n_dipoles_j, n_channels).
+        G_j^T per ROI, shape (d_j, n_channels). Kept, never modified.
     V_list : list of ndarray
-        Current V_j matrices: shape (n_dipoles_j, K).
+        Current V_j matrices, shape (d_j, K). Updated in-place.
     r : ndarray (n_channels, n_channels)
         Noise covariance.
     n_eigenmodes : int
         K = number of eigenmodes per ROI.
     prior_var : float
-        Prior variance on each element of V_j.
+        Current shared prior variance sigma_w^2.
 
     Returns
     -------
     V_list : list of ndarray
         Updated V_j matrices.
-    f_new : ndarray (n_channels, n_sources)
-        Recomputed forward from updated V_j.
+    f_weighted : ndarray (n_channels, n_sources)
+        Recomputed weighted forward = concat(G_j @ V_j).
+    prior_var_new : float
+        Updated shared prior variance (Empirical Bayes).
     """
     K = n_eigenmodes
     nx = len(V_list)
     n_channels = y.shape[1]
 
-    # R^{-1} diagonal fast path
+    # R^{-1} fast path for diagonal R
     r_diag = np.diag(r) if r.ndim == 2 else r * np.ones(n_channels)
     r_inv_diag = 1.0 / np.maximum(r_diag, 1e-30)
-
-    # Build current forward and prediction
-    f_blocks = []
-    for j in range(nx):
-        G_j = G_T_list[j].T           # (n_channels, d_j)
-        f_blocks.append(G_j @ V_list[j])  # (n_channels, K)
-    f_current = np.concatenate(f_blocks, axis=1)  # (n_channels, m)
-    Y_pred = x_bar.dot(f_current.T)               # (T, n_channels)
-
-    # Store initial V for prior center
-    V_init_list = [v.copy() for v in V_list]
     prior_prec = 1.0 / max(prior_var, 1e-30)
+
+    # Build current weighted prediction from current V_list
+    f_blocks = [G_T_list[j].T @ V_list[j] for j in range(nx)]
+    f_weighted = np.concatenate(f_blocks, axis=1)      # (n_channels, m)
+    Y_pred = x_bar.dot(f_weighted.T)                   # (T, n_channels)
 
     for j in range(nx):
         cols = slice(j * K, (j + 1) * K)
@@ -463,46 +468,52 @@ def update_eigenmode_weights(y, x_bar, G_T_list, V_list, r, n_eigenmodes,
         G_j = G_j_T.T                     # (n_channels, d_j)
         V_j_old = V_list[j]               # (d_j, K)
         X_j = x_bar[:, cols]              # (T, K)
-        d_j = G_j_T.shape[0]
 
-        # Remove old ROI j contribution
-        F_j_old = G_j @ V_j_old           # (n_channels, K)
+        # Remove old contribution
+        F_j_old = G_j @ V_j_old
         Y_pred -= X_j.dot(F_j_old.T)
 
-        # Residual with ROI j removed
-        residual = y - Y_pred              # (T, n_channels)
+        # Partial residual
+        residual = y - Y_pred             # (T, n_channels)
 
-        # C = G_j^T R^{-1} G_j  shape (d_j, d_j)
+        # Sufficient statistics
         G_j_T_Rinv = G_j_T * r_inv_diag[None, :]
-        C = G_j_T_Rinv.dot(G_j_T.T)
+        C = G_j_T_Rinv.dot(G_j_T.T)      # (d_j, d_j)
+        S_xx = X_j.T.dot(X_j)            # (K, K)
+        RX = residual.T.dot(X_j)         # (n_channels, K)
+        info_matrix = G_j_T_Rinv.dot(RX) # (d_j, K)
 
-        # S_xx = X_j^T X_j  shape (K, K)
-        S_xx = X_j.T.dot(X_j)
-
-        # info = G_j^T R^{-1} (residual^T X_j)  shape (d_j, K)
-        RX = residual.T.dot(X_j)          # (n_channels, K)
-        info_matrix = G_j_T_Rinv.dot(RX)  # (d_j, K)
-
-        # Solve (S_xx kron C + prior_prec * I) vec(V_j) = vec(info) + prior_prec * vec(V_init)
+        # Posterior solve: (S_xx kron C + prior_prec * I) vec(V_j) = vec(info)
+        # Prior mean = 0 so no prior_mean term on RHS
         precision = np.kron(S_xx, C)
         precision[np.diag_indices_from(precision)] += prior_prec
-
-        rhs = info_matrix.ravel(order='F') + prior_prec * V_init_list[j].ravel(order='F')
+        rhs = info_matrix.ravel(order='F')
 
         try:
-            vec_V = linalg.solve(precision, rhs, assume_a='pos')
-        except linalg.LinAlgError:
-            vec_V = linalg.solve(precision, rhs, assume_a='sym')
+            from scipy import linalg as _linalg
+            vec_V = _linalg.solve(precision, rhs, assume_a='pos')
+        except Exception:
+            from scipy import linalg as _linalg
+            vec_V = _linalg.solve(precision, rhs, assume_a='sym')
 
+        d_j = G_j_T.shape[0]
         V_list[j] = vec_V.reshape((d_j, K), order='F')
 
         # Add back updated contribution
         F_j_new = G_j @ V_list[j]
         Y_pred += X_j.dot(F_j_new.T)
 
-    # Recompute full forward
-    f_new = np.concatenate([G_T_list[j].T @ V_list[j] for j in range(nx)], axis=1)
-    return V_list, f_new
+    # Recompute weighted forward from updated V
+    f_weighted = np.concatenate(
+        [G_T_list[j].T @ V_list[j] for j in range(nx)], axis=1)
+
+    # Empirical Bayes update of shared prior variance
+    # sigma_w^2 = (1 / N_total) * sum_j ||V_j||_F^2
+    total_params = sum(V_list[j].size for j in range(nx))
+    prior_var_new = sum(float(np.sum(V_list[j] ** 2)) for j in range(nx))
+    prior_var_new /= max(total_params, 1)
+
+    return V_list, f_weighted, prior_var_new
 
 
 def test_solve_for_a_and_q(t=1000):

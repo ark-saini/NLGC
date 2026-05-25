@@ -41,8 +41,19 @@ class NeuraLVAR:
     lambda_ = None
     _zeroed_index = None
     restriction = None
-    _eigenmode_weights = None  # V_list: list of (n_dipoles_j, K) per ROI
-    _roi_data = None           # dict with 'G_T_list' and 'V_list'
+    __eigenmode_weights = None  # private: V_list per ROI (d_j, K)
+    __roi_data = None           # private: G_T_list and V_list init
+    __prior_var = 1.0           # private: shared prior variance (learned)
+
+    @property
+    def eigenmode_weights(self):
+        """Read-only access to the learned V weight matrices."""
+        return self.__eigenmode_weights
+
+    @property
+    def prior_var(self):
+        """Read-only access to the learned shared prior variance."""
+        return self.__prior_var
 
     def __init__(self, order, self_history=None, n_eigenmodes=None, copy=True, standardize=False, normalize=False,
             use_lapack=True):
@@ -128,17 +139,21 @@ class NeuraLVAR:
         Qvals = []
         source_fits = []
 
-        # --- eigenmode V weight initialisation ---
+        # --- eigenmode weight init ---
         n_eigenmodes = self._n_eigenmodes
         nx = m // n_eigenmodes
-        has_roi_data = (update_weights and self._roi_data is not None
-                        and 'G_T_list' in self._roi_data
-                        and 'V_list' in self._roi_data)
+        has_roi_data = (update_weights
+                        and self.__roi_data is not None
+                        and 'G_T_list' in self.__roi_data
+                        and 'V_list' in self.__roi_data)
         if has_roi_data:
-            G_T_list = self._roi_data['G_T_list']
-            V_list = [v.copy() for v in self._roi_data['V_list']]
-            self._eigenmode_weights = V_list
-        # ------------------------------------------
+            f_orig = f.copy()                          # keep original f
+            G_T_list = self.__roi_data['G_T_list']
+            V_list = [v.copy() for v in self.__roi_data['V_list']]
+            shared_prior_var = float(weight_prior_var)
+            self.__eigenmode_weights = V_list
+            self.__prior_var = shared_prior_var
+        # ------------------------------
 
         for i in range(max_iter):
             a_[:m] = a_upper
@@ -174,20 +189,22 @@ class NeuraLVAR:
                 if q_upper.min() < 0:
                     warnings.warn(f'Q possibly contains negative value {q_upper.min()}', RuntimeWarning)
 
-            # --- V weight update (recursive, based on posterior) ---
+            # --- V weight update (zero-mean prior, learned variance) ---
             if has_roi_data:
-                V_list, f_new = update_eigenmode_weights(
-                    y, x_[:, :m], G_T_list, V_list, r,
+                V_list, f_weighted, shared_prior_var = update_eigenmode_weights(
+                    y, x_[:, :m], f_orig, G_T_list, V_list, r,
                     n_eigenmodes=n_eigenmodes,
-                    prior_var=weight_prior_var,
+                    prior_var=shared_prior_var,
                 )
-                self._eigenmode_weights = V_list
-                f_[:, :m] = f_new
-                f = f_new
-            # -------------------------------------------------------
+                self.__eigenmode_weights = V_list
+                self.__prior_var = shared_prior_var
+                # keep f_orig intact; update f_ and f for next E-step
+                f_[:, :m] = f_weighted
+                f = f_weighted
+            # -----------------------------------------------------------
 
         a = self._unravel_a(a_upper)
-        return a, q_upper, (lls, ll_s, Qvals, source_fits), f, r, zeroed_index, xs, x_, self._eigenmode_weights
+        return a, q_upper, (lls, ll_s, Qvals, source_fits), f, r, zeroed_index, xs, x_
 
     def compute_ll(self, y, args=None):
         """Returns log(p(y|args=(a, f, q, r))).
@@ -331,6 +348,18 @@ class NeuraLVAR:
         bias = sum([bias_by_idx(i, q_upper, a_, x_, s_, b, m, p, self._zeroed_index) for i in source])
         return bias
 
+    def set_roi_data(self, G_T_list, V_list):
+        """Set per-ROI forward and initial V weights for eigenmode update.
+
+        Parameters
+        ----------
+        G_T_list : list of ndarray
+            G_j^T per ROI, shape (d_j, n_channels).
+        V_list : list of ndarray
+            Initial V_j matrices, shape (d_j, K). Typically U[:,:K] from SVD.
+        """
+        self.__roi_data = {'G_T_list': G_T_list, 'V_list': V_list}
+
     def fit(self, y, f, r, lambda2=None, max_iter=500, max_cyclic_iter=3, a_init=None, q_init=None, rel_tol=0.0001,
             restriction=None, alpha=0.0, beta=0.0, use_es=None,
             update_weights=False, weight_prior_var=1.0):
@@ -347,14 +376,15 @@ class NeuraLVAR:
         a_init : ndarray of shape (order, n_sources, n_sources), default=None
         q_init : ndarray of shape (n_sources, n_sources), default=None
         rel_tol : float, default=0.0001
-        restriction : regular expression like 'i->j' or 'i1,i2->j1,j2', default = None
-            i and j should be integers.
-        alpha: float, default = 0.5
-        beta : float, default = 1
+        restriction : regular expression like 'i->j' or 'i1,i2->j1,j2', default=None
+        alpha : float, default=0.5
+        beta : float, default=1
         update_weights : bool, default=False
-            If True, update per-ROI V weight matrices inside the EM loop.
+            Enable recursive V eigenmode weight update. Requires
+            set_roi_data() to be called first.
         weight_prior_var : float, default=1.0
-            Prior variance for V weight elements.
+            Initial shared prior variance sigma_w^2. Updated automatically
+            at each EM iteration via Empirical Bayes.
 
         Notes
         -----
@@ -366,7 +396,7 @@ class NeuraLVAR:
         if (restriction is None or re.search('->', restriction)) is False:
             raise ValueError(f"restriction:{restriction} should be None or should have format 'i->j'!")
         self.restriction = restriction
-        a, q_upper, lls, f, r, zeroed_index, _, x_, w = self._fit(
+        a, q_upper, lls, f, r, zeroed_index, _, x_ = self._fit(
             y, f, r, lambda2=lambda2, max_iter=max_iter,
             max_cyclic_iter=max_cyclic_iter, a_init=a_init,
             q_init=q_init, rel_tol=rel_tol, alpha=alpha, beta=beta,
@@ -548,7 +578,7 @@ class NeuraLVARCV(NeuraLVAR):
             if i > 0:
                 a_init = a_.copy()
                 # q_init = q_upper.copy() * lambda_range[i-1] / lambda_range[i]
-            a_, q_upper, lls, _, _, _, xs, _, _ = \
+            a_, q_upper, lls, _, _, _, xs, _ = \
                 self._fit(y_train, f, r, lambda2=lambda2, max_iter=max_iter,
                           max_cyclic_iter=max_cyclic_iter,
                           a_init=a_init, q_init=q_init.copy(), rel_tol=rel_tol, xs=xs, alpha=alpha, beta=beta)
@@ -567,8 +597,7 @@ class NeuraLVARCV(NeuraLVAR):
         return None
 
     def fit(self, y, f, r, lambda_range=None, max_iter=500, max_cyclic_iter=3, a_init=None, q_init=None,
-            rel_tol=1e-5, restriction=None, alpha=0.0, beta=0.0, use_es=True,
-            update_weights=False, weight_prior_var=1.0):
+            rel_tol=1e-5, restriction=None, alpha=0.0, beta=0.0, use_es=True):
         """Fits the model from given m/eeg data, forward gain and noise covariance
 
         y : ndarray of shape (n_channels, n_samples)
@@ -584,10 +613,6 @@ class NeuraLVARCV(NeuraLVAR):
             i and j should be integers.
         alpha: float, default = 0.5
         beta : float, default = 1
-        update_weights : bool, default=False
-            If True, update per-ROI V weight matrices inside the EM loop.
-        weight_prior_var : float, default=1.0
-            Prior variance for V weight elements.
 
         Notes
         -----
@@ -664,11 +689,9 @@ class NeuraLVARCV(NeuraLVAR):
             best_lambda = lambda_range[index]
             print(f'best_regularizing parameter: {best_lambda}')
 
-        a, q_upper, lls, f, r, zeroed_index, _, x_, w = self._fit(
-            y, f, r, lambda2=best_lambda, max_iter=max_iter,
-            max_cyclic_iter=max_cyclic_iter, a_init=a_init,
-            q_init=q_init, rel_tol=rel_tol, alpha=alpha, beta=beta,
-            update_weights=update_weights, weight_prior_var=weight_prior_var)
+        a, q_upper, lls, f, r, zeroed_index, _, x_ = self._fit(y, f, r, lambda2=best_lambda, max_iter=max_iter,
+                                                               max_cyclic_iter=max_cyclic_iter, a_init=a_init,
+                                                               q_init=q_init, rel_tol=rel_tol, alpha=alpha, beta=beta)
         self._parameters = (a, f, q_upper, r, x_)
         self._zeroed_index = zeroed_index
         self._lls = lls

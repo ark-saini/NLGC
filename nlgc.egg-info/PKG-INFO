@@ -1,0 +1,24 @@
+Metadata-Version: 2.4
+Name: nlgc
+Version: 0.3.1
+Summary: Latent Causal inference for M/EEG data
+Author: Behrad Soleimani
+Author-email: ['behrad@umd.edu', 'proloy@umd.edu']
+License: BSD 3-Clause
+Project-URL: Sorce Code, https://github.com/proloyd/NLGC
+Requires-Python: >=3.8
+License-File: LICENSE
+Requires-Dist: numpy
+Requires-Dist: scipy
+Requires-Dist: matplotlib
+Requires-Dist: scikit-learn
+Requires-Dist: numba
+Requires-Dist: mne
+Dynamic: author
+Dynamic: author-email
+Dynamic: license
+Dynamic: license-file
+Dynamic: project-url
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary
